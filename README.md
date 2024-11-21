@@ -1,5 +1,7 @@
 # Meme Genie
 
+![Meme Genie](memegenie.png)
+
 Meme Genie is a Python-based application designed to help users create memes effortlessly. Leveraging its intuitive interface and customizable templates, users can unleash their creativity and craft share-worthy memes with ease.
 
 ---
