@@ -41,13 +41,15 @@ class MemeGeneratorApp:
         self.generate_button = tk.Button(root, text="Generate Meme", command=self.generate_meme)
         self.generate_button.grid(row=5, column=0, padx=10, pady=10)
 
-        # Font selection dropdown
+        # Add the font selection dropdown
         self.font_selector_label = tk.Label(root, text="Select Font:")
         self.font_selector_label.grid(row=6, column=0, padx=10, pady=5, sticky="w")
-        self.font_selector = ttk.Combobox(root, values=["DejaVuSans-Bold.ttf", "Arial", "Comic Sans MS"], width=40)
-        self.font_selector.set(self.selected_font)
+        self.font_selector = ttk.Combobox(root, width=40)
         self.font_selector.grid(row=7, column=0, padx=10, pady=10)
         self.font_selector.bind("<<ComboboxSelected>>", self.on_font_select)
+
+        # Populate the font selector with system fonts
+        self.populate_font_selector()
 
         # Text color picker button
         self.color_button = tk.Button(root, text="Select Text Color", command=self.choose_text_color)
@@ -67,6 +69,48 @@ class MemeGeneratorApp:
         # Text shadow toggle
         # self.shadow_checkbox = tk.Checkbutton(root, text="Enable Text Shadow", variable=self.text_shadow, onvalue=True, offvalue=False)
         # self.shadow_checkbox.grid(row=13, column=0, padx=10, pady=5)
+
+    def populate_font_selector(self):
+        """Populate the font selection combobox with available fonts."""
+        font_dirs = [
+            "/usr/share/fonts",  # Common font directory on Linux
+            "/usr/local/share/fonts",  # Additional font directory on Linux
+            os.path.expanduser("~/.fonts"),  # User-specific fonts on Linux
+            "C:/Windows/Fonts",  # Default font directory on Windows
+            "/Library/Fonts",  # Default font directory on macOS
+            "/System/Library/Fonts",  # System fonts on macOS
+        ]
+
+        font_files = []
+        for font_dir in font_dirs:
+            if os.path.exists(font_dir):
+                for root, dirs, files in os.walk(font_dir):
+                    font_files.extend(
+                        [os.path.join(root, file) for file in files if file.lower().endswith(".ttf")]
+                    )
+
+        # Extract font names from file paths for display
+        font_names = []
+        self.font_map = {}  # Map of display names to font file paths
+        for font_file in font_files:
+            try:
+                font_name = os.path.basename(font_file)
+                font_names.append(font_name)
+                self.font_map[font_name] = font_file
+            except Exception as e:
+                continue
+
+        # Set the available fonts in the dropdown
+        self.font_selector['values'] = sorted(font_names)
+        if font_names:
+            default_font = "DejaVuSans-Bold.ttf" if "DejaVuSans-Bold.ttf" in font_names else font_names[0]
+            self.font_selector.set(default_font)
+            self.selected_font = self.font_map[default_font]
+
+    def on_font_select(self, event):
+        """Handler for font selection."""
+        selected_font_name = self.font_selector.get()
+        self.selected_font = self.font_map.get(selected_font_name, None)
 
     def choose_base_image(self):
         file_path = filedialog.askopenfilename(
