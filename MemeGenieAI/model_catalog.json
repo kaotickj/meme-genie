@@ -1,0 +1,31 @@
+{
+  "catalog_version": 1,
+  "models": [
+    {
+      "id": "sd15-q4",
+      "display_name": "Stable Diffusion 1.5 — Q4_0 GGUF (~3.05 GB, suggested)",
+      "filename": "v1-5-pruned_Q4_0.gguf",
+      "url": "https://huggingface.co/kostakoff/stable-diffusion-v1-5-GGUF/resolve/main/v1-5-pruned_Q4_0.gguf",
+      "sha256": "24bcd54c1d1f0354a1cd19d07ad9a20771d43fde8318d505d71bcd84b078f20a",
+      "size_bytes": null,
+      "minimum_size_bytes": 2000000000,
+      "license_name": "CreativeML OpenRAIL-M",
+      "license_url": "https://huggingface.co/kostakoff/stable-diffusion-v1-5-GGUF/blob/main/LICENSE.md",
+      "model_card": "https://huggingface.co/kostakoff/stable-diffusion-v1-5-GGUF",
+      "notes": "Community-quantized conversion. Suggested first test for RX 7600; hardware performance not verified here."
+    },
+    {
+      "id": "sd15-original",
+      "display_name": "Stable Diffusion 1.5 — official safetensors (~4.27 GB)",
+      "filename": "v1-5-pruned-emaonly.safetensors",
+      "url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors",
+      "sha256": "6ce0161689b3853acaa03779ec93eafe75a02f4ced659bee03f50797806fa2fa",
+      "size_bytes": 4265146304,
+      "minimum_size_bytes": 4000000000,
+      "license_name": "CreativeML OpenRAIL-M",
+      "license_url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/main/LICENSE",
+      "model_card": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5",
+      "notes": "Original checkpoint, larger download; most familiar/compatible with SD1.5 workflows."
+    }
+  ]
+}

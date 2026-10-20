@@ -1,0 +1,12 @@
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.test-tmp/
+**/build/
+**/dist/
+**/release/
+**/artifacts/
+*.pyc
+**/diagnostics*/
+**/engine-test/
+**/build-*.log

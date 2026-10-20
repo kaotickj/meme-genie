@@ -1,5 +1,16 @@
 # Meme Genie
 
+The AI Studio development version is in [MemeGenieAI](MemeGenieAI/README.md).
+It adds local image generation, model management, engine diagnostics, and native
+Windows, Linux, and macOS build scripts. Python 3.11+ is required for that version.
+The original editor remains at `memegenie.py`.
+
+GitHub Actions tests and builds AI Studio on all three operating systems and
+uploads native application archives. Models and the native inference engine
+are installed separately. Windows startup and editor checks pass locally;
+AI generation currently fails with the tested native engines, as documented
+in the AI Studio README. Linux/macOS validation is pending CI.
+
 ![Meme Genie](memegenie.png)
 
 Meme Genie is a Python-based application designed to help users create memes effortlessly. Leveraging its intuitive interface and customizable templates, users can unleash their creativity and craft share-worthy memes with ease.
