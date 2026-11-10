@@ -361,6 +361,7 @@ class MemeGeneratorApp(QMainWindow):
         self.prompt_preset.addItem("Custom prompt", "custom")
         self.prompt_preset.addItem("Fallout-inspired wasteland backdrop", "wasteland")
         self.prompt_preset.addItem("Chicago blues album art", "blues")
+        self.prompt_preset.addItem("Bass instrument detail photograph", "instrument")
         self.prompt_preset.addItem("Cinematic gaming thumbnail", "thumbnail")
         self.prompt_preset.addItem("Character portrait for short", "portrait")
         self.prompt_preset.addItem("Clean meme background", "meme")
@@ -493,6 +494,9 @@ class MemeGeneratorApp(QMainWindow):
 
     def apply_prompt_preset(self):
         presets = {
+            "instrument": ("Professional product photograph of one upright double bass, standing alone "
+                           "on a wooden floor against a dark brown wall, warm spotlight, detailed "
+                           "polished wood, sharp focus.", 0),
             "wasteland": ("Wide cinematic post-apocalyptic American wasteland, lonely ruined highway, "
                          "dramatic distant storm clouds, atmospheric perspective, painterly digital concept art, "
                          "no recognizable brands, no lettering", 3),
@@ -509,7 +513,10 @@ class MemeGeneratorApp(QMainWindow):
         if choice in presets:
             prompt, index = presets[choice]
             self.ai_prompt.setPlainText(prompt)
-            self.ai_negative.setPlainText("text, writing, logo, watermark, blurred, distorted, duplicated subjects")
+            negative = "text, writing, logo, watermark, blurred, distorted, duplicated subjects"
+            if choice == "instrument":
+                negative = "people, person, musician, man, woman, face, hands, " + negative
+            self.ai_negative.setPlainText(negative)
             self.dim_preset.setCurrentIndex(index)
 
     def find_engine(self):
@@ -533,8 +540,13 @@ class MemeGeneratorApp(QMainWindow):
 
     def on_model_choice(self, *args):
         info = resolve_model(self.model_choice.currentData())
-        model_paths = [info.installed_path(model_dir()), info.installed_path(BASE_DIR / "models"),
-                       info.installed_path(Path(sys.executable).resolve().parent / "models")]
+        # User-browsed checkpoints can live outside the application model folders.
+        # Switching the catalog must also find sibling checkpoints in that location.
+        current_model = self.sd_model.text().strip()
+        folders = ([Path(current_model).expanduser().parent] if current_model else [])
+        folders += [model_dir(), BASE_DIR / "models",
+                    Path(sys.executable).resolve().parent / "models"]
+        model_paths = [info.installed_path(folder) for folder in folders]
         installed = next((p for p in model_paths if p.is_file() and
                          p.stat().st_size >= info.minimum_size_bytes), None)
         if installed:
