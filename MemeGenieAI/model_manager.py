@@ -315,7 +315,7 @@ def create_offline_bundle(target_zip: Path, *, require_engine: bool = True,
     if require_engine and engine is None:
         raise FileNotFoundError("Engine must be installed to build a fully offline bundle")
     target_zip.parent.mkdir(parents=True, exist_ok=True)
-    files = ["memegenie_ai.py", "sd_backend.py", "model_manager.py", "model_catalog.json",
+    files = ["memegenie_ai.py", "meme_project.py", "ai_meme_layout.py", "openai_layout.py", "openai_images.py", "sd_backend.py", "model_manager.py", "model_catalog.json",
              "setup_models.py", "diagnose_engine.py", "requirements.txt", "README.md", "run_windows.bat", "run_diagnostics_windows.bat", "run_linux.sh",
              "build_windows.bat", "build_linux.sh", "build_macos.sh", "run_macos.sh",
              "build.py", "MemeGenieAI.spec", "requirements-dev.txt", "docs/ENGINE_LICENSE.txt"]

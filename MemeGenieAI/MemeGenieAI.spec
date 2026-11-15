@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 root = Path(SPECPATH)
-source_files = ['memegenie_ai.py', 'sd_backend.py', 'model_manager.py',
+source_files = ['memegenie_ai.py', 'meme_project.py', 'ai_meme_layout.py', 'openai_layout.py', 'openai_images.py', 'sd_backend.py', 'model_manager.py',
                 'model_catalog.json', 'setup_models.py', 'diagnose_engine.py',
                 'requirements.txt', 'requirements-dev.txt', 'README.md',
                 'run_windows.bat', 'run_diagnostics_windows.bat', 'run_linux.sh',

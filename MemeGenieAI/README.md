@@ -101,7 +101,7 @@ Python 3.11+, PyQt6, Pillow, requests and BeautifulSoup. No PyTorch/ROCm Python 
 - **Official sources**: model weights are fetched only from HTTPS URLs in `model_catalog.json`, using pinned SHA-256 checksums. The Windows engine is resolved through the official GitHub releases API and is checked using the asset SHA-256 digest if the API provides one; otherwise HTTPS protects transit, but an independent digest check is unavailable. Upstream changes can break compatibility, so test before distributing.
 - **Model licenses**: the weights are governed by **CreativeML OpenRAIL-M** and its use restrictions. `setup_models.py download` attempts to save the complete license text locally. `setup_models.py license` retries it. The offline packager **requires that license file**. Confirm downstream distribution obligations before sharing the resulting archive.
 - **Engine license**: `stable-diffusion.cpp` is MIT licensed; the engine notice is under `docs/ENGINE_LICENSE.txt`. Third-party dependencies in binaries may carry additional notices.
-- **Privacy**: prompts are passed to `sd-cli` on the local machine, never to a cloud inference provider. Model and engine installers contact Hugging Face and GitHub when the user explicitly asks to install. The existing **Fetch Quote** action contacts `kdgwebsolutions.com` when clicked. No telemetry, login, cloud generation, auto-attribution or added image watermarking.
+- **Privacy**: Stable Diffusion image prompts are passed to `sd-cli` locally. Local caption models use local Ollama. Model and engine installers contact Hugging Face and GitHub when the user explicitly asks to install. The existing **Fetch Quote** action contacts `kdgwebsolutions.com` when clicked. Optional Luna caption/layout requests send the selected crop and brief to OpenAI only when selected; see below. Every image export retains mandatory GitHub attribution.
 - **Source provenance**: original supplied script is preserved as `memegenie_original.py`. Do not import arbitrary `.ckpt` models from untrusted sources; prefer `.safetensors` or `.gguf`.
 
 ## Editor / generation capabilities
@@ -166,3 +166,99 @@ This release adds detailed diagnostics after reports that `sd-cli` initialized t
 If `sd-cli` loads the backend and identifies the SD1.x checkpoint as in the reported log, there is **not yet evidence** of a model/backend format mismatch. A subsequent shader crash, GPU allocation error, failed sampling, or issue writing the output file must be distinguished from the full log or direct diagnostic runs. Reaching the auto-fit stage does not establish generation success. For model corruption check with **Verify SHA-256** or `--verify`. To isolate a conversion-specific defect, repeat the same test with the catalog's original `.safetensors` model, after obtaining it.
 
 Technical references: https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/backend.md and https://github.com/leejet/stable-diffusion.cpp/blob/master/examples/cli/README.md
+
+## Optional OpenAI Luna captions and layouts
+
+Choose **OpenAI · gpt-6-luna (online)** in the existing caption model selector,
+then use **AI: Suggest memes** or **Recheck image** as usual. Local model choices
+and the default remain unchanged. Luna creates editable captions, protected
+subject regions and layouts for the selected background. Stable Diffusion image
+generation and manual editing/export controls remain unchanged.
+
+Provide `OPENAI_API_KEY` in the app process environment, or place only the key in
+`~/.memegenie-ai/openai.key` outside the repository. Create its directory privately
+(`mkdir -p ~/.memegenie-ai; chmod 700 ~/.memegenie-ai`) and enter the key with a
+trusted editor; restrict the file with `chmod 600 ~/.memegenie-ai/openai.key`.
+The file must be owned by you on Unix. On Windows, restrict its ACL to your own
+account. `MEMEGENIE_OPENAI_KEY_FILE` can point to another private file. The
+environment key takes precedence. Never put keys in source, launch scripts,
+QSettings, logs, screenshots, or packaged files. The default private file works
+with the desktop launcher without changing its environment/test profile.
+
+Restart the development app to load the changes. The desktop entry
+`~/Desktop/memegenie-ai-dev-test.desktop` runs
+`~/.local/share/memegenie-ai-dev-test/launch.py`, using the virtual environment
+and source at `~/git/meme-genie-ai-dev/MemeGenieAI`.
+
+Only an explicitly selected Luna suggestion/recheck sends a JPEG of the current
+crop (at most 768 pixels per side) and the brief to OpenAI. API charges apply.
+Local mode never reads an OpenAI key or falls back to cloud. Luna makes one
+request per click, with no automatic retries or fallback. Recheck sends a fresh
+request. This integration does not use the local scene cache or its separate
+caption-rewrite calls. Exact quoted copy, placement checks, subject review,
+Apply/Cancel, and mandatory GitHub credit still use the existing editor code.
+
+The adapter uses the existing `requests` dependency and Responses REST API with
+strict JSON schema, `store: false`, output-token and response-size limits,
+timeouts, and sanitized errors. `store: false` does not promise zero provider
+retention. Refusals, incomplete results, missing keys, network failures and
+model-access errors leave current editor content unchanged. No SDK installation
+is needed; no SDK was installed in this app environment. Keys are excluded from
+the explicit source bundle lists.
+
+Verified against official documentation on 2026-11-15:
+[models](https://developers.openai.com/api/docs/models),
+[structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs),
+[image input](https://developers.openai.com/api/docs/guides/images-vision), and
+[Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create).
+Tests use mocked HTTP and synthetic images only. No paid API request, user-image
+upload, live caption-quality comparison, or account model-access verification
+was performed.
+
+## Optional OpenAI background images
+
+Open **Tools → Experimental Image Generation**, then select
+**OpenAI · gpt-image-2.6-flare (online)** in the new image provider selector.
+The tab remains available through Tools, as before. Local Stable Diffusion is
+still selected at every launch, with its models and settings intact. Image and
+caption provider choices are independent; selecting this option does not change
+Luna/local caption generation.
+
+Use the existing prompt preset or write a prompt, set the resolution and click
+**Generate Image**. The existing negative prompt is appended as an avoidance
+instruction (the Image API has no separate negative-prompt parameter).
+Local-only steps, CFG, seed, sampler, backend and compatibility fields are
+inactive for OpenAI and retain their values when switching back. Local model
+installation controls remain available.
+
+The request generates exactly one PNG using `gpt-image-2.6-flare`, medium quality
+and medium complexity. Square canvases request 1024×1024; landscape requests
+1536×1024; portrait requests 1024×1536. The result is center-cropped/resized
+locally to the selected resolution, so some edges can be cropped. No existing
+background or personal image is sent; this path uses only the prompt text and
+calls `/v1/images/generations`, not an image-edit endpoint.
+
+It shares the Luna key configuration described above. Requests incur OpenAI API
+charges and are never automatically retried or sent as a local fallback. The UI
+links to current model pricing; cost depends on input/output usage. Cancellation
+discards the result and prevents saving/applying it, but cannot guarantee server
+cancellation or avoid charges. A request may take up to the network timeout to
+return; closing waits for the worker to finish. Missing keys, account/model
+access restrictions, rejected prompts, rate limits and network errors appear in
+the existing status area or settings dialog without exposing response bodies or
+credentials. No engine diagnostic file is created for OpenAI requests.
+
+Successful generation opens the clean source in memory for editing and saves a
+PNG with mandatory GitHub attribution in the chosen image folder. Save an
+editable project to retain that clean source with your layers. Reopening the
+credited gallery PNG imports the credit as part of its pixels; later exports
+still add mandatory attribution. Saved generation metadata records the provider,
+model, prompt, negative prompt, quality, complexity and API canvas, never a key.
+A save failure leaves the current editor image unchanged.
+
+Official references checked 2026-11-15:
+[GPT Image 2.6 Flare](https://developers.openai.com/api/docs/models/gpt-image-2.6-flare),
+[Image generation API](https://developers.openai.com/api/reference/resources/images/methods/generate),
+[image guide](https://developers.openai.com/api/docs/guides/image-generation).
+This implementation was tested with mocked HTTP and synthetic images only.
+Account access, live visual quality and actual billing were not tested.

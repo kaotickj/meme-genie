@@ -2,38 +2,78 @@
 
 Copyright (c) 2026 @kaotickj. Bundled model catalog with explicit install and offline-bundle support.
 Third-party model weights are installed with the model manager.
-No network or API key is used for AI image generation.
+Stable Diffusion image generation stays local; Luna caption suggestions are opt-in.
 """
 
 from __future__ import annotations
 
 import os
+import copy
+import json
 import secrets
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont, ImageOps, PngImagePlugin
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat, PngImagePlugin
 
-from PyQt6.QtCore import Qt, QProcess, QSettings, QTimer, QThread, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QPalette, QPixmap, QTextCursor
+from PyQt6.QtCore import Qt, QProcess, QSettings, QTimer, QThread, QUrl, QRectF, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QPalette, QPixmap, QTextCursor, QPen, QBrush
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QRadioButton, QButtonGroup, QScrollArea,
-    QSpinBox, QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QListWidget, QListWidgetItem,
+    QSpinBox, QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QListWidget, QListWidgetItem, QSizePolicy,
 )
 
+from meme_project import TextLayer, render_layers, save_project, load_project, validate_image
+from ai_meme_layout import suggest_layout, fit_caption_layers, place_around_subjects, subject_clearance_regions, NoCaptionSpace
 from sd_backend import GenerationRequest, build_sd_cli_arguments
 from model_manager import (
     BASE_DIR, app_data_dir, model_dir, engine_dir, models, resolve_model,
     download_model, verify_model, install_engine, locate_engine, create_offline_bundle,
     retrieve_model_license,
 )
+
+
+class LayoutWorker(QThread):
+    succeeded = pyqtSignal(str, object)
+    failed = pyqtSignal(str)
+    def __init__(self, image, instruction, model, *, force_analysis=False, provider="local"):
+        super().__init__()
+        self.image, self.instruction, self.model = image.copy(), instruction, model
+        self.force_analysis = force_analysis
+        self.provider = provider
+    def run(self):
+        try:
+            description, layers = suggest_layout(self.image, self.instruction, self.model, alternatives=True, force_analysis=self.force_analysis, provider=self.provider)
+            self.succeeded.emit(description, layers)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class OpenAIImageWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, prompt, negative_prompt, dimensions, output):
+        super().__init__()
+        self.prompt, self.negative_prompt = prompt, negative_prompt
+        self.dimensions, self.output = dimensions, output
+
+    def run(self):
+        from openai_images import generate_image
+        try:
+            image = generate_image(self.prompt, self.negative_prompt, self.dimensions,
+                                   canceled=self.isInterruptionRequested)
+            self.succeeded.emit(image)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class InstallWorker(QThread):
@@ -122,11 +162,92 @@ class ImageView(QGraphicsView):
             self.fitInView(self.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
 
+class ProtectedAreaView(ImageView):
+    """Optional drag-to-protect interaction, confined to the suggestion preview."""
+    area_selected = pyqtSignal(object)
+    area_clicked = pyqtSignal(int)
+
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.selecting=False
+        self.reviewing=False
+        self._areas=[]
+        self._drag_start=None
+        self._drag_item=None
+
+    def show_pil(self,image):
+        self._drag_start=None
+        self._drag_item=None
+        super().show_pil(image)
+
+    def set_selecting(self,active):
+        self.selecting=active
+        self.setCursor(Qt.CursorShape.CrossCursor if active else Qt.CursorShape.ArrowCursor)
+
+    def show_areas(self,areas,selected=-1):
+        self._areas=copy.deepcopy(areas)
+        bounds=self.scene().sceneRect()
+        clearances=subject_clearance_regions(areas)
+        for index,(area,clearance) in enumerate(zip(areas,clearances)):
+            color=QColor('#66ffcc' if index==selected else '#ffcc66')
+            pen=QPen(color);pen.setWidth(2);pen.setCosmetic(True)
+            self.scene().addRect(area['x']*bounds.width(),area['y']*bounds.height(),
+                                area['width']*bounds.width(),area['height']*bounds.height(),
+                                pen,QBrush(QColor(color.red(),color.green(),color.blue(),35)))
+            margin=QPen(color);margin.setCosmetic(True);margin.setStyle(Qt.PenStyle.DashLine)
+            self.scene().addRect(clearance['x']*bounds.width(),clearance['y']*bounds.height(),
+                                clearance['width']*bounds.width(),clearance['height']*bounds.height(),margin)
+            label=self.scene().addText(str(index+1))
+            label.setDefaultTextColor(color)
+            label.setScale(max(1,bounds.width()/350))
+            label.setPos(area['x']*bounds.width(),area['y']*bounds.height())
+
+    def mousePressEvent(self,event):
+        if self.selecting and event.button()==Qt.MouseButton.LeftButton:
+            point=self.mapToScene(event.pos())
+            if self.scene().sceneRect().contains(point):
+                self._drag_start=point
+            event.accept();return
+        if self.reviewing and event.button()==Qt.MouseButton.LeftButton:
+            point=self.mapToScene(event.pos());bounds=self.scene().sceneRect()
+            candidates=[(area['width']*area['height'],index) for index,area in enumerate(self._areas)
+                        if QRectF(area['x']*bounds.width(),area['y']*bounds.height(),
+                                  area['width']*bounds.width(),area['height']*bounds.height()).contains(point)]
+            if candidates:
+                self.area_clicked.emit(min(candidates)[1]);event.accept();return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self,event):
+        if self.selecting and self._drag_start is not None:
+            bounds=self.scene().sceneRect()
+            rect=QRectF(self._drag_start,self.mapToScene(event.pos())).normalized().intersected(bounds)
+            if self._drag_item is not None:self.scene().removeItem(self._drag_item)
+            pen=QPen(QColor('#ffcc66'));pen.setWidth(2);pen.setCosmetic(True)
+            self._drag_item=self.scene().addRect(rect,pen,QBrush(QColor(255,204,102,45)))
+            event.accept();return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self,event):
+        if self.selecting and event.button()==Qt.MouseButton.LeftButton:
+            start=self._drag_start;self._drag_start=None
+            if start is not None:
+                bounds=self.scene().sceneRect()
+                rect=QRectF(start,self.mapToScene(event.pos())).normalized().intersected(bounds)
+                if rect.width()>=bounds.width()*.01 and rect.height()>=bounds.height()*.01:
+                    self.area_selected.emit(dict(label='User protected area',x=rect.x()/bounds.width(),
+                        y=rect.y()/bounds.height(),width=rect.width()/bounds.width(),height=rect.height()/bounds.height()))
+            event.accept();return
+        super().mouseReleaseEvent(event)
+
+
 class MemeGeneratorApp(QMainWindow):
     APP_VERSION = "1.2.1"
 
     def __init__(self):
         super().__init__()
+        self.text_layers = [TextLayer()]
+        self._active_layer = 0
+        self._loading_layers = True
         self.base_image: Image.Image | None = None
         self.base_image_path: str | None = None
         self.selected_font: str | None = None
@@ -134,6 +255,8 @@ class MemeGeneratorApp(QMainWindow):
         self.text_shadow = True
         self.ai_process: QProcess | None = None
         self.install_worker: InstallWorker | None = None
+        self.layout_worker = None
+        self.image_worker = None
         self.ai_canceled = False
         self.ai_output: Path | None = None
         self.ai_log_path: Path | None = None
@@ -147,16 +270,19 @@ class MemeGeneratorApp(QMainWindow):
             self.setWindowIcon(QIcon(str(app_icon)))
         self.resize(1250, 830)
         self.build_ui()
+        self._loading_layers = False
         self.restore_settings()
         self.on_model_choice()
         self.refresh_gallery()
-        self.statusBar().showMessage("Ready. Load an image or generate one locally.")
+        self.statusBar().showMessage("Ready. Choose a background, type your caption, and export your meme.")
 
     def build_ui(self):
         file_menu = self.menuBar().addMenu("File")
         self.add_action(file_menu, "Open Image…", self.choose_base_image)
+        self.add_action(file_menu, "Open Editable Project…", self.open_editable_project)
+        self.add_action(file_menu, "Save Editable Project…", self.save_editable_project)
         self.add_action(file_menu, "Save Edited Image…", self.generate_meme)
-        self.add_action(file_menu, "Save Original / AI Base Image…", self.save_base_image)
+        self.add_action(file_menu, "Save Base Image with Credit…", self.save_base_image)
         file_menu.addSeparator()
         self.add_action(file_menu, "Exit", self.close)
 
@@ -175,13 +301,24 @@ class MemeGeneratorApp(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setMinimumWidth(390)
         self.tabs.addTab(self.build_meme_tab(), "Meme Editor")
-        self.tabs.addTab(self.build_ai_tab(), "AI Image Generation")
+        self.tabs.addTab(self.build_ai_tab(), "Experimental Image Generation")
+        self.tabs.setTabVisible(1, False)
+        tools_menu = self.menuBar().addMenu("Tools")
+        generation_action = self.add_action(tools_menu, "Experimental Image Generation", lambda: None)
+        generation_action.setCheckable(True)
+        generation_action.toggled.connect(lambda visible: self.tabs.setTabVisible(1, visible))
         self.tabs.addTab(self.build_gallery_tab(), "Image Library")
         splitter.addWidget(self.tabs)
 
         preview_panel = QWidget()
         pv_layout = QVBoxLayout(preview_panel)
-        pv_layout.addWidget(QLabel("<b>Image Preview</b>  •  Source resolution is preserved on export"))
+        pv_layout.addWidget(QLabel("<b>Image Preview</b>"))
+        self.preview_format = QComboBox()
+        self.preview_format.addItem("Original image", None)
+        self.preview_format.addItem("Widescreen · 1920 × 1080", (1920,1080))
+        self.preview_format.addItem("Shorts · 1080 × 1920", (1080,1920))
+        self.preview_format.currentIndexChanged.connect(self.update_preview)
+        pv_layout.addWidget(self.preview_format)
         self.image_preview = ImageView()
         pv_layout.addWidget(self.image_preview, 1)
         self.preview_size = QLabel("No image loaded")
@@ -222,20 +359,72 @@ class MemeGeneratorApp(QMainWindow):
 
     def build_meme_tab(self):
         layout = QVBoxLayout()
-        open_btn = QPushButton("Choose Base Image…")
+        open_btn = QPushButton("1. Choose Background…")
         open_btn.clicked.connect(self.choose_base_image)
         layout.addWidget(open_btn)
 
-        layout.addWidget(QLabel("Meme / caption text (leave empty for image-only export):"))
+        layer_row = QHBoxLayout()
+        self.layer_choice = QComboBox()
+        self.layer_choice.addItem("Text layer 1")
+        self.layer_choice.currentIndexChanged.connect(self.select_text_layer)
+        layer_row.addWidget(self.layer_choice, 1)
+        add_layer = QPushButton("Add text")
+        add_layer.clicked.connect(self.add_text_layer)
+        remove_layer = QPushButton("Remove text")
+        remove_layer.clicked.connect(self.remove_text_layer)
+        layer_row.addWidget(add_layer)
+        layer_row.addWidget(remove_layer)
+        layout.addLayout(layer_row)
+        layout.addWidget(QLabel("2. Type your caption:"))
         self.text_input = QTextEdit()
-        self.text_input.setPlaceholderText("Enter meme text or fetch a quote…")
+        self.text_input.setPlaceholderText("Type a caption, or ask the AI to write and style one.")
         self.text_input.setFixedHeight(130)
-        self.text_input.textChanged.connect(self.update_preview)
+        self.text_input.textChanged.connect(self.on_caption_changed)
         layout.addWidget(self.text_input)
 
-        quote_btn = QPushButton("Fetch Quote (requires internet)")
-        quote_btn.clicked.connect(self.fetch_quote)
-        layout.addWidget(quote_btn)
+        self.caption_brief = QLineEdit()
+        self.caption_brief.setPlaceholderText("AI idea or tone, e.g. a joke about Monday mornings")
+        self.caption_brief.setMaxLength(2000)
+        layout.addWidget(self.caption_brief)
+        self.caption_model = QComboBox()
+        self.caption_model.addItems(["gemma3:4b", "qwen3.5:9b-q8_0", "gemma4:12b-it-q8_0"])
+        self.caption_model.addItem("OpenAI · gpt-6-luna (online)", "openai")
+        layout.addWidget(self.caption_model)
+        self.caption_provider_note = QLabel()
+        self.caption_provider_note.setWordWrap(True)
+        layout.addWidget(self.caption_provider_note)
+        self.caption_model.currentIndexChanged.connect(self.update_caption_provider_note)
+        self.update_caption_provider_note()
+        self.caption_ai_button = QPushButton("AI: Suggest memes")
+        self.caption_ai_button.clicked.connect(self.start_ai_layout)
+        self.caption_recheck_button = QPushButton("Recheck image")
+        self.caption_recheck_button.setToolTip("Re-examine the image and create new suggestions. Use this when the AI misunderstood the picture.")
+        self.caption_recheck_button.clicked.connect(lambda: self.start_ai_layout(force_analysis=True))
+        ai_actions = QHBoxLayout()
+        ai_actions.addWidget(self.caption_ai_button,1)
+        ai_actions.addWidget(self.caption_recheck_button)
+        layout.addLayout(ai_actions)
+        self.caption_ai_status = QLabel("Ready to suggest a caption")
+        self.caption_ai_status.setWordWrap(True)
+        layout.addWidget(self.caption_ai_status)
+
+        self.auto_layout_checkbox = QCheckBox("Automatically arrange captions")
+        self.auto_layout_checkbox.setChecked(False)
+        self.auto_layout_checkbox.toggled.connect(lambda enabled: self.auto_arrange_text() if enabled else None)
+        layout.addWidget(self.auto_layout_checkbox)
+        arrange = QPushButton("Arrange text now")
+        arrange.clicked.connect(self.auto_arrange_text)
+        layout.addWidget(arrange)
+        details_toggle = QPushButton("Fine-tune text settings…")
+        details_toggle.setCheckable(True)
+        details_toggle.setChecked(True)
+        layout.addWidget(details_toggle)
+        self.text_details = QWidget()
+        details = QVBoxLayout(self.text_details)
+        self.text_details.setVisible(True)
+        details_toggle.toggled.connect(self.text_details.setVisible)
+        details_toggle.toggled.connect(lambda opened: self.auto_layout_checkbox.setChecked(False) if opened else None)
+        layout.addWidget(self.text_details)
 
         form = QFormLayout()
         self.font_selector = QComboBox()
@@ -247,11 +436,23 @@ class MemeGeneratorApp(QMainWindow):
         self.font_size.setValue(60)
         self.font_size.valueChanged.connect(self.update_preview)
         form.addRow("Font size:", self.font_size)
+        self.layer_x = QSpinBox()
+        self.layer_y = QSpinBox()
+        self.layer_width = QSpinBox()
+        for control, maximum, value in ((self.layer_x, 95, 5), (self.layer_y, 95, 40), (self.layer_width, 95, 90)):
+            control.setRange(5 if control is self.layer_width else 0, maximum)
+            control.setValue(value)
+            control.setSuffix(" %")
+            control.valueChanged.connect(self.update_preview)
+        self.layer_x.valueChanged.connect(lambda x: self.layer_width.setMaximum(100-x))
+        form.addRow("Left position:", self.layer_x)
+        form.addRow("Top position:", self.layer_y)
+        form.addRow("Text box width:", self.layer_width)
 
         color_btn = QPushButton("Select Color…")
         color_btn.clicked.connect(self.choose_text_color)
         form.addRow("Text color:", color_btn)
-        layout.addLayout(form)
+        details.addLayout(form)
 
         alignment = QHBoxLayout()
         self.align_group = QButtonGroup(self)
@@ -261,23 +462,19 @@ class MemeGeneratorApp(QMainWindow):
             btn.setChecked(label == "Center")
             btn.toggled.connect(self.update_preview)
             alignment.addWidget(btn)
-        layout.addLayout(alignment)
+        details.addLayout(alignment)
 
         self.text_shadow_checkbox = QCheckBox("Text shadow")
         self.text_shadow_checkbox.setChecked(True)
         self.text_shadow_checkbox.toggled.connect(self.shadow_action.setChecked)
         self.text_shadow_checkbox.toggled.connect(self.update_preview)
         self.shadow_action.toggled.connect(self.text_shadow_checkbox.setChecked)
-        layout.addWidget(self.text_shadow_checkbox)
+        details.addWidget(self.text_shadow_checkbox)
 
-        self.attribution_checkbox = QCheckBox("Add Meme Genie attribution to exported image")
-        self.attribution_checkbox.setChecked(False)
-        self.attribution_checkbox.toggled.connect(self.update_preview)
-        layout.addWidget(self.attribution_checkbox)
 
-        save_btn = QPushButton("Save Edited Image…")
+        save_btn = QPushButton("3. Export Meme…")
         save_btn.clicked.connect(self.generate_meme)
-        layout.addWidget(save_btn)
+        layout.insertWidget(layout.indexOf(self.text_details)-1, save_btn)
         export_presets = QHBoxLayout()
         widescreen_export = QPushButton("Export YouTube 1920 × 1080…")
         widescreen_export.clicked.connect(lambda: self.export_sized(1920, 1080))
@@ -290,11 +487,22 @@ class MemeGeneratorApp(QMainWindow):
 
     def build_ai_tab(self):
         layout = QVBoxLayout()
-        intro = QLabel("AI images are generated locally. Use Install Model to download a verified "
+        intro = QLabel("Local AI images use Stable Diffusion. Use Install Model to download a verified "
                        "Stable Diffusion 1.5 checkpoint. On Windows, Install Engine obtains "
                        "the official Vulkan build. Once installed, generation is fully offline.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
+
+        self.image_provider = QComboBox()
+        self.image_provider.addItem("Local · Stable Diffusion", "local")
+        self.image_provider.addItem("OpenAI · gpt-image-2.6-flare (online)", "openai")
+        layout.addWidget(self.image_provider)
+        self.image_provider_note = QLabel()
+        self.image_provider_note.setWordWrap(True)
+        self.image_provider_note.setMaximumWidth(350)
+        self.image_provider_note.setOpenExternalLinks(True)
+        layout.addWidget(self.image_provider_note)
+        self.image_provider.currentIndexChanged.connect(self.update_image_provider)
 
         paths_group = QGroupBox("Local engine and installed models")
         paths_form = QFormLayout(paths_group)
@@ -442,6 +650,7 @@ class MemeGeneratorApp(QMainWindow):
         self.ai_log.setMaximumBlockCount(2000)
         self.ai_log.setMinimumHeight(105)
         layout.addWidget(self.ai_log)
+        self.update_image_provider()
         return self.scrolling_tab(layout)
 
     @staticmethod
@@ -472,6 +681,15 @@ class MemeGeneratorApp(QMainWindow):
         self.ai_backend.setCurrentIndex(int(self.settings.value("ai/backend_index", 0)))
 
     def closeEvent(self, event):
+        if self.image_worker is not None and self.image_worker.isRunning():
+            QMessageBox.information(self, "OpenAI image request running",
+                "Wait for the request to finish or time out before closing. Cancel discards its result; API charges may still apply.")
+            event.ignore()
+            return
+        if self.layout_worker is not None and self.layout_worker.isRunning():
+            QMessageBox.information(self, "Caption suggestion running", "The caption request is still running. Please wait for its result or timeout before closing.")
+            event.ignore()
+            return
         if self.install_worker is not None and self.install_worker.isRunning():
             self.install_worker.cancel()
             self.install_worker.wait(6000)
@@ -656,19 +874,62 @@ class MemeGeneratorApp(QMainWindow):
         open_any.clicked.connect(self.choose_base_image)
         row.addWidget(open_any)
         root.addLayout(row)
+        clear = QPushButton("Clear Image Library…")
+        clear.clicked.connect(lambda: self.clear_gallery())
+        root.addWidget(clear)
+        restore = QPushButton("Restore cleared library entries")
+        restore.clicked.connect(self.restore_gallery)
+        root.addWidget(restore)
         return self.scrolling_tab(root)
 
-    def refresh_gallery(self):
+    @staticmethod
+    def library_key(file):
+        stat = file.stat()
+        return json.dumps([str(file.resolve()), stat.st_size, stat.st_mtime_ns])
+
+    def library_files(self):
         folder = Path(self.output_dir.text().strip()).expanduser()
-        self.gallery.clear()
         if not folder.is_dir():
-            return
-        for file in sorted(folder.iterdir(), key=lambda f: f.stat().st_mtime,
-                           reverse=True):
-            if file.is_file() and file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-                item = QListWidgetItem(file.name)
-                item.setData(Qt.ItemDataRole.UserRole, str(file))
-                self.gallery.addItem(item)
+            return []
+        return sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}), key=lambda p:p.stat().st_mtime, reverse=True)
+
+    def hidden_library_entries(self):
+        try:
+            entries=json.loads(self.settings.value("library/hidden_entries", "[]"))
+            return set(entries) if isinstance(entries,list) and all(isinstance(x,str) for x in entries) else set()
+        except (ValueError,TypeError):
+            return set()
+
+    def clear_gallery(self, *, confirm=True):
+        files=self.library_files()
+        hidden=self.hidden_library_entries()
+        new={self.library_key(p) for p in files}-hidden
+        if not new:
+            self.statusBar().showMessage("Image Library is already clear.")
+            return 0
+        if confirm and QMessageBox.question(self,"Clear Image Library",f"Hide {len(new)} image entries from this library? No image files, saved projects or current canvas will be deleted. Restore cleared library entries brings them back.") != QMessageBox.StandardButton.Yes:
+            return 0
+        self.settings.setValue("library/hidden_entries",json.dumps(sorted(hidden|new)))
+        self.settings.sync()
+        self.refresh_gallery()
+        self.statusBar().showMessage(f"Cleared {len(new)} library entries. All image files remain on disk.")
+        return len(new)
+
+    def restore_gallery(self):
+        self.settings.remove("library/hidden_entries")
+        self.settings.sync()
+        self.refresh_gallery()
+        self.statusBar().showMessage("Cleared library entries restored. No files changed.")
+
+    def refresh_gallery(self):
+        self.gallery.clear()
+        hidden=self.hidden_library_entries()
+        for file in self.library_files():
+            if self.library_key(file) in hidden:
+                continue
+            item = QListWidgetItem(file.name)
+            item.setData(Qt.ItemDataRole.UserRole, str(file))
+            self.gallery.addItem(item)
             if self.gallery.count() >= 500:
                 break
 
@@ -697,8 +958,104 @@ class MemeGeneratorApp(QMainWindow):
         if path:
             self.output_dir.setText(path)
 
+    def update_image_provider(self):
+        online = self.image_provider.currentData() == "openai"
+        self.image_provider_note.setText(
+            'OpenAI: one paid image per click, medium quality/complexity. Sends prompts only. '
+            'Negative prompt is added as an avoidance instruction. Standard API canvas is cropped/resized '
+            'to your resolution. Steps, CFG, seed, sampler and backend apply only to local generation. '
+            '<a href="https://developers.openai.com/api/docs/models/gpt-image-2.6-flare">Current pricing</a>. '
+            'Cancel discards the result; charges may still apply.' if online else
+            "Local generation stays on this computer and uses the selected engine/model and settings.")
+        for control in (self.ai_steps, self.ai_cfg, self.ai_seed, self.ai_sampler, self.ai_backend, self.ai_compat_mode):
+            control.setEnabled(not online)
+
+    def start_openai_image(self):
+        from openai_images import generation_body
+        from openai_layout import api_key
+        prompt, negative = self.ai_prompt.toPlainText(), self.ai_negative.toPlainText()
+        dimensions = self.dim_preset.currentData()
+        try:
+            generation_body(prompt, negative, dimensions)
+            api_key()
+            output_dir = Path(self.output_dir.text().strip()).expanduser()
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "OpenAI image settings", str(exc))
+            return
+        output = output_dir / ("meme_genie_openai_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".png")
+        self.ai_canceled = False
+        self.ai_log_path = None
+        self.ai_last_command = ""
+        self.ai_log.clear()
+        self.ai_generate_btn.setEnabled(False)
+        self.ai_cancel_btn.setEnabled(True)
+        self.ai_progress.setRange(0, 0)
+        self.ai_status.setText("Generating one image with OpenAI (API charges apply)…")
+        self.image_worker = OpenAIImageWorker(prompt, negative, dimensions, output)
+        self.image_worker.succeeded.connect(self.openai_image_ready)
+        self.image_worker.failed.connect(self.openai_image_failed)
+        self.image_worker.finished.connect(self.openai_image_finished)
+        self.image_worker.start()
+
+    def openai_image_finished(self):
+        self.ai_generate_btn.setEnabled(True)
+        self.ai_cancel_btn.setEnabled(False)
+        self.ai_progress.setRange(0, 100)
+
+    def openai_image_failed(self, reason):
+        self.ai_progress.setValue(0)
+        self.ai_status.setText("OpenAI image unavailable: " + reason + ". Current editor image is unchanged.")
+
+    def openai_image_ready(self, image):
+        if self.ai_canceled:
+            self.openai_image_failed("Result discarded; API charges may still apply")
+            return
+        from openai_images import MODEL, native_size
+        worker = self.image_worker
+        metadata = {"Meme Genie AI provider": "OpenAI", "Meme Genie AI model": MODEL,
+                    "Meme Genie AI prompt": worker.prompt,
+                    "Meme Genie AI negative prompt": worker.negative_prompt,
+                    "Meme Genie AI quality": "medium", "Meme Genie AI complexity": "medium",
+                    "Meme Genie AI API size": native_size(worker.dimensions)}
+        temp_path = None
+        try:
+            pnginfo = PngImagePlugin.PngInfo()
+            for key, value in metadata.items():
+                pnginfo.add_text(key, value)
+            with tempfile.NamedTemporaryFile(dir=worker.output.parent, prefix=".memegenie-", suffix=".png", delete=False) as handle:
+                temp_path = Path(handle.name)
+            self.add_attribution(image).save(temp_path, format="PNG", pnginfo=pnginfo)
+            os.replace(temp_path, worker.output)
+        except (OSError, ValueError) as exc:
+            self.openai_image_failed("Image received but could not be saved: " + str(exc))
+            return
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        # Keep the clean source in memory for editing; every saved image gets credit.
+        self.base_image = image.copy()
+        self.base_image_path = str(worker.output)
+        self.ai_output = worker.output
+        self.ai_generation_metadata = metadata
+        if self.auto_layout_checkbox.isChecked():
+            self.auto_arrange_text()
+        else:
+            self.update_preview()
+        self.refresh_gallery()
+        self.ai_progress.setRange(0, 100)
+        self.ai_progress.setValue(100)
+        self.ai_status.setText("OpenAI image generated and opened in editor. Credited image saved at: " + str(worker.output))
+        self.tabs.setCurrentIndex(0)
+        self.statusBar().showMessage("OpenAI image generated successfully.")
+
     def generate_ai_image(self):
+        if self.image_worker is not None and self.image_worker.isRunning():
+            return
         if self.ai_process is not None and self.ai_process.state() != QProcess.ProcessState.NotRunning:
+            return
+        if self.image_provider.currentData() == "openai":
+            self.start_openai_image()
             return
         output_dir = Path(self.output_dir.text().strip()).expanduser()
         try:
@@ -801,6 +1158,12 @@ class MemeGeneratorApp(QMainWindow):
             QMessageBox.warning(self, "Engine error", self.ai_process.errorString())
 
     def cancel_ai(self):
+        if self.image_worker is not None and self.image_worker.isRunning():
+            self.ai_canceled = True
+            self.image_worker.requestInterruption()
+            self.ai_cancel_btn.setEnabled(False)
+            self.ai_status.setText("Discarding OpenAI result when the request returns; API charges may still apply.")
+            return
         proc = self.ai_process
         if proc is None or proc.state() == QProcess.ProcessState.NotRunning:
             return
@@ -892,13 +1255,383 @@ class MemeGeneratorApp(QMainWindow):
 
     def load_base_image(self, path: str, from_ai: bool):
         with Image.open(path) as original:
+            validate_image(original)
             original.load()
             self.base_image = original.convert("RGBA")
         self.base_image_path = path
         if not from_ai:
             self.ai_generation_metadata = {}
-        self.update_preview()
+        if self.auto_layout_checkbox.isChecked():
+            self.auto_arrange_text()
+        else:
+            self.update_preview()
         self.statusBar().showMessage("Loaded " + path)
+
+    def update_caption_provider_note(self):
+        online = self.caption_model.currentData() == "openai"
+        self.caption_provider_note.setText(
+            "Luna sends this image crop and brief to OpenAI when you click Suggest or Recheck (API charges apply)."
+            if online else "Local model: image and brief stay on this computer.")
+
+    def start_ai_layout(self, *, force_analysis=False):
+        if self.base_image is None:
+            QMessageBox.information(self, "Choose a background", "Choose the image the AI should look at first.")
+            return
+        if self.layout_worker is not None and self.layout_worker.isRunning():
+            return
+        self.capture_text_layer()
+        self._layout_background = self.base_image.copy()
+        self._layout_dimensions = self.preview_format.currentData()
+        model_image = self.base_image
+        if self._layout_dimensions:
+            model_image = ImageOps.fit(model_image,self._layout_dimensions,method=Image.Resampling.LANCZOS,centering=(.5,.5))
+        provider = self.caption_model.currentData() or "local"
+        model = "gpt-6-luna" if provider == "openai" else self.caption_model.currentText()
+        self._layout_provider = provider
+        self.layout_worker = LayoutWorker(model_image, self.caption_brief.text(), model, force_analysis=force_analysis, provider=provider)
+        self.layout_worker.succeeded.connect(self.preview_ai_layout)
+        self.layout_worker.failed.connect(self.layout_failed)
+        self.layout_worker.finished.connect(lambda: (self.caption_ai_button.setEnabled(True),self.caption_recheck_button.setEnabled(True)))
+        self.caption_ai_button.setEnabled(False)
+        self.caption_recheck_button.setEnabled(False)
+        self.caption_ai_status.setText(("OpenAI Luna" if provider == "openai" else "Local AI") + " is preparing caption ideas. You can keep editing; nothing is replaced without Apply.")
+        self.layout_worker.start()
+
+    def layout_failed(self, reason):
+        self.caption_ai_status.setText("AI suggestion unavailable: " + reason + ". Your image and text are unchanged; manual editing still works.")
+
+    def preview_ai_layout(self, description, layers):
+        # Accept legacy single-proposal calls as well as the new alternatives response.
+        options = layers if layers and isinstance(layers[0],dict) else [{"name":"Suggestion", "layers":layers}]
+        orientation_changed = hasattr(self,'_layout_dimensions') and self.preview_format.currentData()!=self._layout_dimensions
+        if orientation_changed or self.base_image is None or self.base_image.size != self._layout_background.size or self.base_image.tobytes() != self._layout_background.tobytes():
+            self.layout_failed("Background or orientation changed while the suggestion was running. Try again for the current image")
+            return
+        design_background=self.base_image
+        dimensions=self.preview_format.currentData()
+        if dimensions:
+            design_background=ImageOps.fit(design_background,dimensions,method=Image.Resampling.LANCZOS,centering=(.5,.5))
+        # Subject-checked proposals already have collision-free rendered bounds.
+        # Re-running the generic fitter could move them onto a protected subject.
+        options=[option if option.get('subject_checked') else
+                 {**option,'layers':fit_caption_layers(design_background,option['layers'],self.font_map)} for option in options]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preview AI suggestion")
+        dialog.resize(850,700)
+        layout = QVBoxLayout(dialog)
+        summary = QLabel("AI image description: " + description)
+        summary.setTextFormat(Qt.TextFormat.PlainText)
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        choices = QComboBox()
+        for option in options:
+            choices.addItem(option['name'])
+        layout.addWidget(choices)
+        original_options=copy.deepcopy(options)
+        model_regions=[copy.deepcopy(option.get('protected_regions',[])) for option in options]
+        user_areas=[]
+        history=[]
+        draw_target=None
+        placement_errors={i:o['placement_error'] for i,o in enumerate(options) if o.get('placement_error')}
+        preview = ProtectedAreaView()
+        protect = QCheckBox("Keep an area clear")
+        protect.setToolTip("Mark up to four additional areas to keep clear across these suggestions.")
+        review = QCheckBox("Review subject areas")
+        review.setToolTip("Inspect automatic boxes, redraw inaccurate ones, or remove false detections.")
+        undo_area = QPushButton("Undo area")
+        undo_area.setEnabled(False)
+        area_row=QHBoxLayout();area_row.addWidget(protect);area_row.addWidget(review);area_row.addWidget(undo_area)
+        layout.addLayout(area_row)
+        region_controls=QWidget();region_row=QHBoxLayout(region_controls);region_row.setContentsMargins(0,0,0,0)
+        region_choices=QComboBox();region_choices.setObjectName('protectedRegionChoice')
+        redraw=QPushButton("Redraw area");remove=QPushButton("Remove area")
+        region_row.addWidget(region_choices,1);region_row.addWidget(redraw);region_row.addWidget(remove)
+        layout.addWidget(region_controls)
+        def current_areas():
+            return model_regions[choices.currentIndex()]+user_areas
+        def show_choice():
+            index=choices.currentIndex();areas=current_areas()
+            selected=min(max(0,region_choices.currentIndex()),len(areas)-1)
+            region_choices.blockSignals(True);region_choices.clear()
+            count=len(model_regions[index])
+            for i,area in enumerate(areas):
+                origin='Marked' if i>=count else ('Reviewed' if area.get('reviewed') else 'AI')
+                region_choices.addItem(f"{i+1}. {origin}: {area['label']}")
+            region_choices.setCurrentIndex(selected);region_choices.blockSignals(False)
+            region_controls.setVisible(review.isChecked())
+            redraw.setEnabled(bool(areas) and not protect.isChecked())
+            remove.setEnabled(bool(areas) and not protect.isChecked())
+            if protect.isChecked() or review.isChecked():
+                background=design_background
+                if not protect.isChecked() and index not in placement_errors:
+                    background=render_layers(background,options[index]['layers'],self.font_map)
+                preview.show_pil(background);preview.show_areas(areas,selected)
+                if protect.isChecked():
+                    instruction="Drag the replacement box around the whole subject." if draw_target else "Drag over the face or object you want to keep clear."
+                else:
+                    instruction="Select a box or its name. Dashed edges show the full clearance margin. Redraw or remove inaccurate AI boxes."
+                note.setText(placement_errors.get(index,'')+' '+instruction)
+            else:
+                preview.show_pil(self.add_attribution(render_layers(design_background,options[index]['layers'],self.font_map)))
+                note.setText(placement_errors.get(index,"Apply uses these editable captions. Cancel keeps your current text."))
+            preview.reviewing=review.isChecked()
+            preview.set_selecting(protect.isChecked())
+            buttons.button(QDialogButtonBox.StandardButton.Apply).setEnabled(index not in placement_errors and not protect.isChecked())
+        def recompute():
+            placement_errors.clear()
+            for index,option in enumerate(original_options):
+                regions=model_regions[index]+user_areas
+                if regions==option.get('protected_regions',[]) and not option.get('placement_error'):
+                    options[index]=copy.deepcopy(option)
+                    continue
+                try:
+                    placed=place_around_subjects(design_background,option['layers'],regions)
+                    options[index]={**option,'layers':placed,'subject_checked':True,'protected_regions':copy.deepcopy(regions)}
+                except NoCaptionSpace:
+                    placement_errors[index]="No readable caption space remains. Review the boxes, undo a change, or cancel to edit the caption manually."
+            undo_area.setEnabled(bool(history))
+            protect.setEnabled(len(user_areas)<4 or draw_target is not None)
+            show_choice()
+        def remember():
+            history.append(copy.deepcopy((model_regions,user_areas)))
+        def change_region(target,replacement=None):
+            kind,record=target
+            if kind=='user':
+                position=user_areas.index(record)
+                if replacement is None:user_areas.pop(position)
+                else:user_areas[position]=replacement
+            else:
+                # Scene observations normally match across alternatives. Apply
+                # the correction to matching boxes, preserving distinct ones.
+                for regions in model_regions:
+                    for position in range(len(regions)-1,-1,-1):
+                        if regions[position]==record:
+                            if replacement is None:regions.pop(position)
+                            else:regions[position]=copy.deepcopy(replacement)
+        def selected_target():
+            index=region_choices.currentIndex();count=len(model_regions[choices.currentIndex()])
+            if index<0:return None
+            return ('model' if index<count else 'user',copy.deepcopy(current_areas()[index]))
+        def add_area(area):
+            nonlocal draw_target
+            if draw_target is None and len(user_areas)>=4:return
+            remember();area={**area,'reviewed':True}
+            if draw_target:
+                area['label']=draw_target[1]['label'];change_region(draw_target,area)
+            else:user_areas.append(area)
+            draw_target=None;protect.setChecked(False);recompute()
+        def start_redraw():
+            nonlocal draw_target
+            draw_target=selected_target()
+            if draw_target:
+                protect.setEnabled(True);protect.setChecked(True);show_choice()
+        def remove_area():
+            target=selected_target()
+            if target:remember();change_region(target);recompute()
+        def undo():
+            nonlocal draw_target
+            draw_target=None;protect.setChecked(False)
+            if history:
+                saved_regions,saved_user=history.pop()
+                model_regions[:]=saved_regions;user_areas[:]=saved_user
+            recompute()
+        def drawing_changed(active):
+            nonlocal draw_target
+            if not active:
+                draw_target=None
+                protect.setEnabled(len(user_areas)<4)
+            show_choice()
+        def choice_changed():
+            nonlocal draw_target
+            draw_target=None;protect.setChecked(False);region_choices.setCurrentIndex(-1);show_choice()
+        preview.area_selected.connect(add_area)
+        preview.area_clicked.connect(region_choices.setCurrentIndex)
+        protect.toggled.connect(drawing_changed)
+        review.toggled.connect(show_choice)
+        undo_area.clicked.connect(undo)
+        redraw.clicked.connect(start_redraw);remove.clicked.connect(remove_area)
+        region_choices.currentIndexChanged.connect(show_choice)
+        choices.currentIndexChanged.connect(choice_changed)
+        layout.addWidget(preview,1)
+        note = QLabel("Check that faces and key objects remain clear. Apply replaces your current captions with these editable suggestions. Cancel keeps your current text.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Minimum)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        review.setChecked(bool(placement_errors))
+        show_choice()
+        if dialog.exec() == QDialog.DialogCode.Accepted and choices.currentIndex() not in placement_errors and not protect.isChecked():
+            self.auto_layout_checkbox.setChecked(False)
+            self.text_layers = options[choices.currentIndex()]['layers']
+            self._active_layer = 0
+            self.refresh_layer_choices()
+            self.caption_ai_status.setText("AI caption and style applied. Font, size, position and text remain editable.")
+        else:
+            self.caption_ai_status.setText("Suggestion discarded. Your current captions are unchanged.")
+
+    def on_caption_changed(self):
+        if self._loading_layers:
+            return
+        if self.auto_layout_checkbox.isChecked():
+            self.auto_arrange_text()
+        else:
+            self.update_preview()
+
+    def auto_arrange_text(self):
+        """Local deterministic layout assistance, not model inference."""
+        if self._loading_layers or self.base_image is None:
+            return
+        from dataclasses import replace
+        cursor = self.text_input.textCursor()
+        cursor_position, cursor_anchor = cursor.position(), cursor.anchor()
+        self.capture_text_layer()
+        count = len(self.text_layers)
+        for index, layer in enumerate(self.text_layers):
+            if count == 1:
+                # Prefer the quieter end of the supplied image, reserving credit space.
+                gray = self.base_image.convert("L").resize((128,128))
+                top = ImageStat.Stat(gray.crop((6,6,122,45))).var[0]
+                bottom = ImageStat.Stat(gray.crop((6,72,122,108))).var[0]
+                y = .05 if top <= bottom else .54
+                available = .35
+            else:
+                available = .76 / count
+                y = .04 + index * available
+            # Fit a multiline caption into its allocated band using actual font metrics.
+            size = 48
+            draw = ImageDraw.Draw(self.base_image)
+            while size > 10:
+                font = self.font_for_path(None, max(10, round(size*self.base_image.width/512)))
+                lines = self.wrapped_text(draw, layer.text, font, self.base_image.width*.9)
+                if len(lines)*font.size*1.25 <= self.base_image.height*available:
+                    break
+                size -= 1
+            self.text_layers[index] = replace(layer, x=.05, y=y, width=.9, size=size,
+                align="center", color=(255,255,255,255), shadow=True, font="DejaVuSans-Bold.ttf")
+        self.load_layer_controls()
+        cursor = self.text_input.textCursor()
+        cursor.setPosition(cursor_anchor)
+        cursor.setPosition(cursor_position, QTextCursor.MoveMode.KeepAnchor)
+        self.text_input.setTextCursor(cursor)
+        self.statusBar().showMessage("Captions arranged.")
+
+    def capture_text_layer(self):
+        if self._loading_layers:
+            return
+        from dataclasses import asdict
+        values = self.layer_control_values()
+        previous = getattr(self, '_loaded_control_values', {})
+        old = asdict(self.text_layers[self._active_layer])
+        if getattr(self, '_loaded_control_index', None) == self._active_layer:
+            values = {key:old[key] if previous.get(key)==value else value for key,value in values.items()}
+        self.text_layers[self._active_layer] = TextLayer(**values)
+        self._loaded_control_values = self.layer_control_values()
+        self._loaded_control_index = self._active_layer
+
+    def layer_control_values(self):
+        return dict(text=self.text_input.toPlainText()[:20000], x=self.layer_x.value()/100,
+            y=self.layer_y.value()/100, width=min(self.layer_width.value()/100,1-self.layer_x.value()/100),
+            size=self.font_size.value(), font=self.font_selector.currentText() or "DejaVuSans-Bold.ttf",
+            align=self.selected_alignment(), color=self.text_color, shadow=self.text_shadow)
+
+    def select_text_layer(self, index):
+        if self._loading_layers or index < 0 or index >= len(self.text_layers):
+            return
+        self.capture_text_layer()
+        self._active_layer = index
+        self.load_layer_controls()
+
+    def load_layer_controls(self):
+        self._loading_layers = True
+        layer = self.text_layers[self._active_layer]
+        self.text_input.setPlainText(layer.text)
+        if self.font_selector.findText(layer.font) < 0:
+            self.font_selector.addItem(layer.font)
+        self.font_selector.setCurrentText(layer.font)
+        self.font_size.setValue(layer.size)
+        self.layer_x.setValue(round(layer.x*100))
+        self.layer_y.setValue(round(layer.y*100))
+        self.layer_width.setValue(round(layer.width*100))
+        self.text_color = layer.color
+        self.text_shadow = layer.shadow
+        self.shadow_action.setChecked(layer.shadow)
+        for button in self.align_group.buttons():
+            button.setChecked(button.text().lower() == layer.align)
+        self._loaded_control_values = self.layer_control_values()
+        self._loaded_control_index = self._active_layer
+        self._loading_layers = False
+        self.update_preview()
+
+    def refresh_layer_choices(self):
+        self._loading_layers = True
+        self.layer_choice.clear()
+        self.layer_choice.addItems([f"Text layer {i+1}" for i in range(len(self.text_layers))])
+        self.layer_choice.setCurrentIndex(self._active_layer)
+        self._loading_layers = False
+        self.load_layer_controls()
+
+    def add_text_layer(self):
+        if len(self.text_layers) >= 20:
+            QMessageBox.warning(self, "Layer limit", "This project supports up to 20 text layers.")
+            return
+        self.capture_text_layer()
+        self.text_layers.append(TextLayer(y=.1 if len(self.text_layers) % 2 else .7))
+        self._active_layer = len(self.text_layers)-1
+        self.refresh_layer_choices()
+
+    def remove_text_layer(self):
+        if self.text_input.toPlainText().strip() and QMessageBox.question(
+                self, "Remove text layer", "Remove the selected text layer?") != QMessageBox.StandardButton.Yes:
+            return
+        del self.text_layers[self._active_layer]
+        if not self.text_layers:
+            self.text_layers = [TextLayer()]
+        self._active_layer = min(self._active_layer, len(self.text_layers)-1)
+        self.refresh_layer_choices()
+
+    def save_editable_project(self):
+        if self.base_image is None:
+            QMessageBox.warning(self, "No image", "Load a background first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Editable Project", "meme.mgproject", "Meme project (*.mgproject)")
+        if not path:
+            return
+        if not path.lower().endswith('.mgproject'):
+            path += '.mgproject'
+        self.capture_text_layer()
+        try:
+            save_project(path, self.base_image, self.text_layers, True)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Project save failed", str(exc))
+            return
+        self.statusBar().showMessage("Editable project saved: " + path)
+
+    def open_editable_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Editable Project", "", "Meme project (*.mgproject)")
+        if not path:
+            return
+        try:
+            background, layers, attribution = load_project(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Project open failed", str(exc))
+            return
+        if self.base_image is not None and QMessageBox.question(
+                self, "Replace current project", "Replace the current editor contents? Save your editable project first if needed.") != QMessageBox.StandardButton.Yes:
+            return
+        self._loading_layers = True
+        self.base_image = background
+        self.base_image_path = None
+        self.ai_generation_metadata = {}
+        self.text_layers = layers
+        self.auto_layout_checkbox.setChecked(False)
+        self._active_layer = 0
+        self._loading_layers = False
+        self.refresh_layer_choices()
+        self.tabs.setCurrentIndex(0)
+        self.statusBar().showMessage("Opened editable project: " + path)
 
     def selected_alignment(self):
         for btn in self.align_group.buttons():
@@ -937,48 +1670,42 @@ class MemeGeneratorApp(QMainWindow):
                 lines.append(line)
         return lines
 
-    def render_meme(self):
+    def render_meme(self, background=None):
         if self.base_image is None:
             return None
-        result = self.base_image.copy()
-        text = self.text_input.toPlainText()
-        draw = ImageDraw.Draw(result)
-        width, height = result.size
-        if text.strip():
-            # Scale fonts down on smaller source images while preserving large-image clarity.
-            font_px = min(self.font_size.value(), max(12, width // 7))
-            font = self.font_for_path(self.selected_font, font_px)
-            lines = self.wrapped_text(draw, text, font, int(width * .9))
-            line_spacing = max(4, font_px // 6)
-            metrics = [draw.textbbox((0, 0), line or "Ag", font=font) for line in lines]
-            heights = [max(12, box[3] - box[1]) for box in metrics]
-            total_height = sum(heights) + line_spacing * max(0, len(lines) - 1)
-            y = max(8, (height - total_height) // 2)
-            shadow_color = (0, 0, 0, 255) if sum(self.text_color[:3]) >= 384 else (255, 255, 255, 255)
-            for line, box, line_height in zip(lines, metrics, heights):
-                if line:
-                    span = box[2] - box[0]
-                    align = self.selected_alignment()
-                    x = 10 if align == "left" else (width - span - 10 if align == "right" else (width - span) // 2)
-                    x = max(5, x)
-                    if self.text_shadow:
-                        offset = max(2, font_px // 20)
-                        draw.text((x + offset, y + offset), line, font=font, fill=shadow_color)
-                    draw.text((x, y), line, font=font, fill=self.text_color)
-                y += line_height + line_spacing
-        if self.attribution_checkbox.isChecked():
-            credit = "Meme Genie, by @kaotickj"
-            size = max(10, min(20, width // 70))
-            font = self.font_for_path(self.selected_font, size)
-            box = draw.textbbox((0, 0), credit, font=font)
-            x = max(5, width - (box[2] - box[0]) - 12)
-            y = max(5, height - (box[3] - box[1]) - 12)
-            draw.text((x, y), credit, font=font, fill=(255, 255, 255, 220),
-                      stroke_width=1, stroke_fill=(0, 0, 0, 180))
+        self.capture_text_layer()
+        result = render_layers(self.base_image if background is None else background, self.text_layers, self.font_map)
+        return self.add_attribution(result)
+
+    @staticmethod
+    def add_attribution(image):
+        """Mandatory visible original credit; never mutate the editable background."""
+        validate_image(image)
+        source = image.convert("RGBA")
+        credit = "Generated by Meme Genie, by @kaotickj: https://github.com/kaotickj"
+        width = max(240, source.width)
+        size = max(10, min(20, width // 40))
+        font = MemeGeneratorApp.font_for_path(None, size)
+        probe = ImageDraw.Draw(Image.new("RGB",(1,1)))
+        lines = MemeGeneratorApp.wrapped_text(probe, credit, font, width-16)
+        line_height = size + 5
+        footer_height = len(lines)*line_height + 12
+        height = max(source.height, footer_height + 32)
+        # Fit the entire rendered meme above the credit instead of painting over captions.
+        result = Image.new("RGBA",(width,height),(15,15,15,255))
+        fitted = ImageOps.contain(source,(width,height-footer_height),Image.Resampling.LANCZOS)
+        result.paste(fitted,((width-fitted.width)//2,0))
+        draw=ImageDraw.Draw(result)
+        y=height-footer_height
+        for line in lines:
+            draw.text((8,y+6),line,font=font,fill="white")
+            y+=line_height
         return result
 
     def update_preview(self, *args):
-        rendered = self.render_meme()
+        if self._loading_layers:
+            return
+        rendered = self.selected_preview_image()
         if rendered is None:
             return
         self.image_preview.show_pil(rendered)
@@ -995,8 +1722,18 @@ class MemeGeneratorApp(QMainWindow):
         except (requests.RequestException, ValueError) as exc:
             QMessageBox.warning(self, "Quote retrieval failed", str(exc))
 
+    def selected_preview_image(self):
+        dimensions = self.preview_format.currentData()
+        return self.sized_meme(*dimensions) if dimensions else self.render_meme()
+
+    def sized_meme(self, width, height):
+        if self.base_image is None:
+            return None
+        background = ImageOps.fit(self.base_image,(width,height),method=Image.Resampling.LANCZOS,centering=(.5,.5))
+        return self.render_meme(background).convert("RGB")
+
     def generate_meme(self):
-        result = self.render_meme()
+        result = self.selected_preview_image()
         if result is None:
             QMessageBox.warning(self, "No image", "Load or generate an image first.")
             return
@@ -1024,14 +1761,12 @@ class MemeGeneratorApp(QMainWindow):
 
     def export_sized(self, width: int, height: int):
         """Precisely size images for YouTube; resize doesn't add AI detail."""
-        rendered = self.render_meme()
-        if rendered is None:
+        if self.base_image is None:
             QMessageBox.warning(self, "No image", "Load or generate an image first.")
             return
-        # Scale and crop proportionally to fill the target canvas.
-        sized = ImageOps.fit(rendered.convert("RGB"), (width, height),
-                             method=Image.Resampling.LANCZOS,
-                             centering=(.5, .5))
+        # Crop the background first, then lay out captions in output coordinates.
+        # This avoids cropping captions when changing the output aspect ratio.
+        sized = self.sized_meme(width,height)
         save_path, kind = QFileDialog.getSaveFileName(self,
             f"Export {width} × {height}",
             str(Path(self.output_dir.text().strip()).expanduser() / f"meme_{width}x{height}.png"),
@@ -1059,12 +1794,12 @@ class MemeGeneratorApp(QMainWindow):
         if self.base_image is None:
             QMessageBox.warning(self, "No image", "Load or generate an image first.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Original Base Image", "base_image.png", "PNG (*.png)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Base Image with Credit", "base_image.png", "PNG (*.png)")
         if path:
             target = Path(path)
             if target.suffix.lower() != ".png":
                 target = target.with_suffix(".png")
-            self.base_image.save(target, format="PNG")
+            self.add_attribution(self.base_image).save(target, format="PNG")
             self.statusBar().showMessage("Base image saved to " + str(target))
 
     def show_instructions(self):
